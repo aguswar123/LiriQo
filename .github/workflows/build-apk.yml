@@ -99,6 +99,8 @@ jobs:
           cat > app/src/main/java/com/liriqo/downloader/MainActivity.kt <<'EOF'
           package com.liriqo.downloader
 
+          import android.content.ClipData
+          import android.content.ClipboardManager
           import android.content.ContentValues
           import android.content.Context
           import android.os.Bundle
@@ -130,6 +132,7 @@ jobs:
               val lrc: String, val wordLrc: String, val ttml: String,
               val translation: String, val romanization: String
           )
+          data class Pending(val name: String, val ext: String, val content: String)
           data class Result(val title: String, val artist: String, val tracks: List<Track>)
 
           fun ts(sec: Double): String {
@@ -244,6 +247,7 @@ jobs:
               var loading by remember { mutableStateOf(false) }
               var error by remember { mutableStateOf<String?>(null) }
               var result by remember { mutableStateOf<Result?>(null) }
+              var pending by remember { mutableStateOf<Pending?>(null) }
 
               Column(Modifier.fillMaxSize().statusBarsPadding().padding(16.dp)) {
                   Text("LiriQo Lyrics Downloader", style = MaterialTheme.typography.titleLarge)
@@ -276,8 +280,7 @@ jobs:
                           items(r.tracks) { t ->
                               val fileName = "${r.artist} - ${r.title} (${t.provider})"
                               fun save(suffix: String, ext: String, content: String) {
-                                  runCatching { saveFile(ctx, fileName + suffix, ext, content) }
-                                      .onFailure { Toast.makeText(ctx, "Save failed", Toast.LENGTH_SHORT).show() }
+                                  pending = Pending(fileName + suffix, ext, content)
                               }
                               Card(Modifier.fillMaxWidth()) {
                                   Column(Modifier.padding(12.dp)) {
@@ -307,6 +310,28 @@ jobs:
                           }
                       }
                   }
+              }
+              pending?.let { p ->
+                  AlertDialog(
+                      onDismissRequest = { pending = null },
+                      title = { Text(".${p.ext}") },
+                      text = { Text(p.name) },
+                      confirmButton = {
+                          TextButton(onClick = {
+                              runCatching { saveFile(ctx, p.name, p.ext, p.content) }
+                                  .onFailure { Toast.makeText(ctx, "Save failed", Toast.LENGTH_SHORT).show() }
+                              pending = null
+                          }) { Text("Save to file") }
+                      },
+                      dismissButton = {
+                          TextButton(onClick = {
+                              val cm = ctx.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                              cm.setPrimaryClip(ClipData.newPlainText(p.name, p.content))
+                              Toast.makeText(ctx, "Copied to clipboard", Toast.LENGTH_SHORT).show()
+                              pending = null
+                          }) { Text("Copy to clipboard") }
+                      }
+                  )
               }
           }
           EOF
