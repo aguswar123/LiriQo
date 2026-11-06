@@ -123,7 +123,7 @@ jobs:
           import java.util.Locale
 
           // Change this if you deploy your own fork of the API.
-          private const val BASE = "https://api.liriqo-alfarrizi.workers.dev/v1/lyrics"
+          private const val BASE = "https://api.liriqo-alfarrizi.my.id/v1/lyrics"
 
           data class Track(
               val provider: String, val sync: String, val plain: String,
