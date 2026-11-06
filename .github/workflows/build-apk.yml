@@ -1,0 +1,336 @@
+name: Build Android APK
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/build-apk.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Generate Android project
+        run: |
+          mkdir -p android-build && cd android-build
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "LiriQoDownloader"
+          include(":app")
+          EOF
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          EOF
+          mkdir -p app
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.liriqo.downloader"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.liriqo.downloader"
+                  minSdk = 29
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              buildFeatures { compose = true }
+              composeOptions { kotlinCompilerExtensionVersion = "1.5.14" }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+              implementation("androidx.activity:activity-compose:1.9.1")
+              implementation(platform("androidx.compose:compose-bom:2024.06.00"))
+              implementation("androidx.compose.ui:ui")
+              implementation("androidx.compose.material3:material3")
+              implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
+          }
+          EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:label="LiriQo Lyrics"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          mkdir -p app/src/main/java/com/liriqo/downloader
+          cat > app/src/main/java/com/liriqo/downloader/MainActivity.kt <<'EOF'
+          package com.liriqo.downloader
+
+          import android.content.ContentValues
+          import android.content.Context
+          import android.os.Bundle
+          import android.provider.MediaStore
+          import android.widget.Toast
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.foundation.lazy.LazyColumn
+          import androidx.compose.foundation.lazy.items
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.unit.dp
+          import kotlinx.coroutines.Dispatchers
+          import kotlinx.coroutines.launch
+          import kotlinx.coroutines.withContext
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.net.URLEncoder
+          import java.util.Locale
+
+          // Change this if you deploy your own fork of the API.
+          private const val BASE = "https://api.liriqo-alfarrizi.workers.dev/v1/lyrics"
+
+          data class Track(
+              val provider: String, val sync: String, val plain: String,
+              val lrc: String, val wordLrc: String, val ttml: String,
+              val translation: String, val romanization: String
+          )
+          data class Result(val title: String, val artist: String, val tracks: List<Track>)
+
+          fun ts(sec: Double): String {
+              val mm = (sec / 60).toInt()
+              return String.format(Locale.US, "%02d:%05.2f", mm, sec - mm * 60)
+          }
+
+          // Detects ISRC, YouTube videoId, link, or plain song search.
+          fun buildUrl(input: String): String {
+              val text = input.trim()
+              val compact = text.replace("-", "").uppercase()
+              val (param, value) = when {
+                  text.startsWith("http") -> "url" to text
+                  !text.contains(" ") && Regex("^[A-Z]{2}[A-Z0-9]{3}\\d{7}$").matches(compact) -> "isrc" to compact
+                  Regex("^[A-Za-z0-9_-]{11}$").matches(text) && Regex("[0-9_-]|.[A-Z]").containsMatchIn(text) -> "v" to text
+                  else -> "Q" to text
+              }
+              return "$BASE?$param=${URLEncoder.encode(value, "UTF-8")}"
+          }
+
+          fun fetchLyrics(input: String): Result {
+              val conn = URL(buildUrl(input)).openConnection() as HttpURLConnection
+              conn.connectTimeout = 15000
+              conn.readTimeout = 40000
+              val code = conn.responseCode
+              val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+              val body = stream.bufferedReader().use { it.readText() }
+              if (code !in 200..299) error("Server returned $code")
+
+              val root = JSONObject(body)
+              val d = root.optJSONObject("data") ?: root
+              val meta = d.optJSONObject("metadata")
+              val arr = d.optJSONArray("tracks") ?: error("No lyrics found")
+
+              val tracks = (0 until arr.length()).map { i ->
+                  val t = arr.getJSONObject(i)
+                  fun str(vararg keys: String): String {
+                      for (k in keys) {
+                          if (!t.isNull(k)) { val v = t.optString(k); if (v.isNotBlank()) return v }
+                      }
+                      return ""
+                  }
+                  val timed = t.optJSONArray("timed")
+                  val lines = timed?.let { a -> (0 until a.length()).map { a.getJSONObject(it) } } ?: emptyList()
+                  val maxStart = lines.maxOfOrNull { it.optDouble("start", 0.0) } ?: 0.0
+                  val div = if (maxStart > 3600) 1000.0 else 1.0 // ms vs seconds
+
+                  val lrc = lines.joinToString("\n") {
+                      "[${ts(it.optDouble("start", 0.0) / div)}]${it.optString("text")}"
+                  }
+
+                  val hasWords = lines.any { (it.optJSONArray("words")?.length() ?: 0) > 0 }
+                  val wordLrc = if (!hasWords) "" else lines.joinToString("\n") { l ->
+                      val start = "[${ts(l.optDouble("start", 0.0) / div)}]"
+                      val ws = l.optJSONArray("words")
+                      if (ws == null || ws.length() == 0) {
+                          start + l.optString("text")
+                      } else {
+                          val list = (0 until ws.length()).map { ws.getJSONObject(it) }
+                          val joined = list.joinToString("") { it.optString("text") }
+                          val sep = if (joined == l.optString("text")) "" else " "
+                          val sb = StringBuilder(start)
+                          list.forEachIndexed { idx, w ->
+                              sb.append("<").append(ts(w.optDouble("start", 0.0) / div)).append(">")
+                              sb.append(if (sep.isEmpty()) w.optString("text") else w.optString("text").trim())
+                              if (idx < list.lastIndex) sb.append(sep)
+                          }
+                          val end = list.last().optDouble("end", -1.0)
+                          if (end >= 0) sb.append("<").append(ts(end / div)).append(">")
+                          sb.toString()
+                      }
+                  }
+
+                  val plain = str("plain").ifBlank { lines.joinToString("\n") { it.optString("text") } }
+                  Track(
+                      provider = t.optString("provider"), sync = t.optString("syncLevel"),
+                      plain = plain, lrc = lrc, wordLrc = wordLrc, ttml = str("ttml"),
+                      translation = str("translation"),
+                      romanization = str("romanization", "romanisation", "roma", "romaji")
+                  )
+              }.filter { it.plain.isNotBlank() }
+              if (tracks.isEmpty()) error("No lyrics found")
+              return Result(meta?.optString("title") ?: input, meta?.optString("artist") ?: "", tracks)
+          }
+
+          fun saveFile(ctx: Context, name: String, ext: String, content: String) {
+              val safe = name.replace(Regex("[\\\\/:*?\"<>|]"), "_")
+              val values = ContentValues().apply {
+                  put(MediaStore.Downloads.DISPLAY_NAME, "$safe.$ext")
+                  put(MediaStore.Downloads.MIME_TYPE, "application/octet-stream")
+                  put(MediaStore.Downloads.RELATIVE_PATH, "Download/LiriQo")
+              }
+              val uri = ctx.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                  ?: error("Cannot create file")
+              ctx.contentResolver.openOutputStream(uri)!!.use { it.write(content.toByteArray()) }
+              Toast.makeText(ctx, "Saved to Download/LiriQo/$safe.$ext", Toast.LENGTH_LONG).show()
+          }
+
+          class MainActivity : ComponentActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  setContent { MaterialTheme { Surface(Modifier.fillMaxSize()) { App() } } }
+              }
+          }
+
+          @OptIn(ExperimentalLayoutApi::class)
+          @Composable
+          fun App() {
+              val ctx = androidx.compose.ui.platform.LocalContext.current
+              val scope = rememberCoroutineScope()
+              var query by remember { mutableStateOf("") }
+              var loading by remember { mutableStateOf(false) }
+              var error by remember { mutableStateOf<String?>(null) }
+              var result by remember { mutableStateOf<Result?>(null) }
+
+              Column(Modifier.fillMaxSize().statusBarsPadding().padding(16.dp)) {
+                  Text("LiriQo Lyrics Downloader", style = MaterialTheme.typography.titleLarge)
+                  Spacer(Modifier.height(12.dp))
+                  OutlinedTextField(
+                      value = query, onValueChange = { query = it },
+                      label = { Text("Song + artist, link, ISRC or YouTube ID") },
+                      modifier = Modifier.fillMaxWidth(), singleLine = true
+                  )
+                  Spacer(Modifier.height(8.dp))
+                  Button(
+                      enabled = query.isNotBlank() && !loading,
+                      onClick = {
+                          loading = true; error = null; result = null
+                          scope.launch {
+                              try { result = withContext(Dispatchers.IO) { fetchLyrics(query) } }
+                              catch (e: Exception) { error = e.message ?: "Request failed" }
+                              loading = false
+                          }
+                      },
+                      modifier = Modifier.fillMaxWidth()
+                  ) { Text(if (loading) "Searching…" else "Search") }
+
+                  error?.let { Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(top = 8.dp)) }
+
+                  result?.let { r ->
+                      Text("${r.title} — ${r.artist}", style = MaterialTheme.typography.titleMedium,
+                          modifier = Modifier.padding(vertical = 12.dp))
+                      LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                          items(r.tracks) { t ->
+                              val fileName = "${r.artist} - ${r.title} (${t.provider})"
+                              fun save(suffix: String, ext: String, content: String) {
+                                  runCatching { saveFile(ctx, fileName + suffix, ext, content) }
+                                      .onFailure { Toast.makeText(ctx, "Save failed", Toast.LENGTH_SHORT).show() }
+                              }
+                              Card(Modifier.fillMaxWidth()) {
+                                  Column(Modifier.padding(12.dp)) {
+                                      Text("${t.provider} · ${t.sync}", style = MaterialTheme.typography.labelLarge)
+                                      Text(t.plain.lines().take(3).joinToString("\n"),
+                                          style = MaterialTheme.typography.bodySmall,
+                                          modifier = Modifier.padding(vertical = 6.dp))
+                                      FlowRow(
+                                          horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                          verticalArrangement = Arrangement.spacedBy(4.dp)
+                                      ) {
+                                          if (t.lrc.isNotBlank()) Button(onClick = { save("", "lrc", t.lrc) }) { Text(".lrc") }
+                                          if (t.wordLrc.isNotBlank()) Button(onClick = { save(" (word-sync)", "lrc", t.wordLrc) }) { Text("Word .lrc") }
+                                          if (t.ttml.isNotBlank()) Button(onClick = { save("", "ttml", t.ttml) }) { Text(".ttml") }
+                                          OutlinedButton(onClick = { save("", "txt", t.plain) }) { Text(".txt") }
+                                          if (t.translation.isNotBlank()) {
+                                              val ext = if (Regex("^\\s*\\[\\d+:\\d+").containsMatchIn(t.translation)) "lrc" else "txt"
+                                              OutlinedButton(onClick = { save(" (translation)", ext, t.translation) }) { Text("Translation") }
+                                          }
+                                          if (t.romanization.isNotBlank()) {
+                                              val ext = if (Regex("^\\s*\\[\\d+:\\d+").containsMatchIn(t.romanization)) "lrc" else "txt"
+                                              OutlinedButton(onClick = { save(" (romanization)", ext, t.romanization) }) { Text("Romanization") }
+                                          }
+                                      }
+                                  }
+                              }
+                          }
+                      }
+                  }
+              }
+          }
+          EOF
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+
+      - name: Build debug APK
+        working-directory: android-build
+        run: gradle assembleDebug --no-daemon
+
+      - name: Rename APK
+        run: cp android-build/app/build/outputs/apk/debug/app-debug.apk LiriQo-Lyrics.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LiriQo-Lyrics-apk
+          path: LiriQo-Lyrics.apk
+
+      - name: Publish release (direct APK download)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "apk-${{ github.run_number }}" LiriQo-Lyrics.apk \
+            --title "LiriQo Lyrics APK #${{ github.run_number }}" \
+            --notes "Debug build. Download LiriQo-Lyrics.apk and install."
